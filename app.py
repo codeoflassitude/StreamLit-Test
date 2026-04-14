@@ -123,7 +123,7 @@ if liked_input != st.session_state.liked_titles:
 
 # Display current liked movies
 if st.session_state.liked_titles:
-    st.sidebar.subheader("Currently Liked")
+    st.sidebar.subheader("Currently Liked Movies")
     for title in st.session_state.liked_titles:
         st.sidebar.write(f"• {title}")
 
@@ -212,27 +212,39 @@ st.subheader("💬 Feedback Loop - Discover & Rate Random Movies")
 st.caption("Rate random movies to better understand your taste. Click 'Refresh Recommendations' when done.")
 
 if st.button("🎲 Show Random Movies for Feedback"):
+    # Fix: Convert liked_titles (list) to set for proper union
+    liked_set = set(st.session_state.liked_titles)
+    excluded_set = st.session_state.excluded_titles
+    
     # Generate 12 random movies (excluding already liked or excluded)
-    available = df[~df['title'].isin(st.session_state.liked_titles | st.session_state.excluded_titles)]
-    random_indices = random.sample(range(len(available)), min(12, len(available)))
-    st.session_state.feedback_movies = available.iloc[random_indices].index.tolist()
+    available = df[~df['title'].isin(liked_set | excluded_set)]
+    
+    if len(available) == 0:
+        st.warning("No more movies available for feedback.")
+    else:
+        n = min(12, len(available))
+        random_indices = random.sample(range(len(available)), n)
+        st.session_state.feedback_movies = available.iloc[random_indices].index.tolist()
+        st.success(f"✅ Showing {n} random movies for feedback")
 
 # Show feedback movies if available
-if st.session_state.feedback_movies:
+if st.session_state.get('feedback_movies'):
     st.write("Rate these movies:")
     for idx in st.session_state.feedback_movies:
         row = df.iloc[idx]
         col1, col2, col3 = st.columns([6, 1, 1])
         with col1:
             st.write(f"**{row['title']}**")
-            st.caption(f"Genres: {row['genres']} | Rating: {row['vote_average']:.1f}")
+            st.caption(f"Genres: {row.get('genres', 'N/A')} | Rating: {row.get('vote_average', 0):.1f}")
         with col2:
-            if st.button("👍", key=f"like_{idx}"):
+            if st.button("👍 Like", key=f"like_{idx}"):
                 if row['title'] not in st.session_state.liked_titles:
                     st.session_state.liked_titles.append(row['title'])
+                    st.toast(f"Added '{row['title']}' to liked movies")
         with col3:
-            if st.button("👎", key=f"dislike_{idx}"):
+            if st.button("👎 Dislike", key=f"dislike_{idx}"):
                 st.session_state.excluded_titles.add(row['title'])
+                st.toast(f"Excluded '{row['title']}'")
 
 # ====================== REFRESH BUTTON ======================
 if st.button("🔄 Refresh Recommendations", type="secondary"):
