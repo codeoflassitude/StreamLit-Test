@@ -206,15 +206,44 @@ if st.button("🚀 Get Recommendations", type="primary"):
     st.session_state.rec_df = st.session_state.rec_df.head(15)
     
     st.success(f"✅ Top 15 recommendations using **{model_choice}**")
-    
-    # Display recommendations
-    display_df = st.session_state.rec_df[['title', 'score', 'genres', 'vote_average', 'popularity']].copy()
-    display_df = display_df.style.format({
-        'score': "{:.3f}",
-        'vote_average': "{:.1f}",
-        'popularity': "{:.1f}"
-    })
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    st.subheader("🎥 Recommended Movies")
+
+    for _, row in rec_df.iterrows():
+        col1, col2 = st.columns([1, 3])
+        
+        with col1:
+            # Display poster if poster_path exists
+            if 'poster_path' in df.columns and pd.notna(row.get('poster_path')):
+                poster_url = f"https://image.tmdb.org/t/p/w500{row['poster_path']}"
+                st.image(poster_url, width=150)
+            else:
+                st.image("https://via.placeholder.com/150x225?text=No+Poster", width=150)
+        
+        with col2:
+            st.subheader(row['title'])
+            
+            # IMDb / Vote Average
+            vote = row.get('vote_average', 0)
+            st.write(f"**IMDb Rating:** ⭐ {vote:.1f}/10")
+            
+            # Genres
+            st.write(f"**Genres:** {row.get('genres', 'N/A')}")
+            
+            # Why you may like this (keywords)
+            keywords = row.get('keywords_text', '')
+            if keywords:
+                # Clean and show top keywords (split and limit to 8-10)
+                kw_list = [k.replace('_', ' ').title() for k in keywords.split() if k]
+                why_text = ", ".join(kw_list[:10])  # Limit to 10 keywords
+                st.write(f"**Why you may like this:** {why_text}")
+            else:
+                st.write("**Why you may like this:** Similar genres and story elements")
+            
+            # Optional small score for debugging (you can remove later)
+            # st.caption(f"Match Score: {row['score']:.3f}")
+        
+        st.divider()  # Nice separation between movies
 
 # ====================== FEEDBACK LOOP (Random Movies) ======================
 st.subheader("💬 Feedback Loop - Discover & Rate Random Movies")
