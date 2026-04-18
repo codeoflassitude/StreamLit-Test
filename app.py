@@ -255,47 +255,57 @@ if st.button("🚀 Get Recommendations", type="primary"):
     else:
         st.info("No recommendations generated yet. Click 'Get Recommendations' above.")
 
-# ====================== FEEDBACK LOOP (Random Movies) ======================
+# ====================== FEEDBACK LOOP (Random Movies with Posters) ======================
 st.subheader("💬 Feedback Loop - Discover & Rate Random Movies")
-st.caption("Rate random movies to better understand your taste. Click 'Refresh Recommendations' when done.")
+st.caption("Rate these random movies to help fine-tune your taste. Use 👍 to add to liked movies and 👎 to exclude.")
 
 if st.button("🎲 Show Random Movies for Feedback"):
-    # Fix: Convert liked_titles (list) to set for proper union
-    liked_set = set(st.session_state.liked_titles)
-    excluded_set = st.session_state.excluded_titles
-    
-    # Generate 12 random movies (excluding already liked or excluded)
-    available = df[~df['title'].isin(liked_set | excluded_set)]
-    
-    if len(available) == 0:
-        st.warning("No more movies available for feedback.")
-    else:
-        n = min(12, len(available))
-        random_indices = random.sample(range(len(available)), n)
+    # Generate 10–12 random movies (excluding already liked or excluded)
+    available = df[~df['title'].isin(list(st.session_state.liked_titles) + list(st.session_state.excluded_titles))]
+    if len(available) > 0:
+        sample_size = min(12, len(available))
+        random_indices = random.sample(range(len(available)), sample_size)
         st.session_state.feedback_movies = available.iloc[random_indices].index.tolist()
-        st.success(f"✅ Showing {n} random movies for feedback")
+    else:
+        st.warning("No more movies available for feedback.")
+        st.session_state.feedback_movies = []
 
-# Show feedback movies if available
+# Show feedback movies with posters
 if st.session_state.get('feedback_movies'):
-    st.write("Rate these movies:")
+    st.write("**Rate these movies:**")
+    
     for idx in st.session_state.feedback_movies:
         row = df.iloc[idx]
-        col1, col2, col3 = st.columns([6, 1, 1])
+        poster_path = row.get('poster_path')  # Change column name if different
+        
+        col1, col2, col3, col4 = st.columns([1.2, 5, 1, 1])
+        
         with col1:
-            st.write(f"**{row['title']}**")
-            st.caption(f"Genres: {row.get('genres', 'N/A')} | Rating: {row.get('vote_average', 0):.1f}")
+            if pd.notna(poster_path) and str(poster_path).strip() != "":
+                poster_url = f"https://image.tmdb.org/t/p/w200/{poster_path}"
+                st.image(poster_url, width=100)
+            else:
+                st.image("https://via.placeholder.com/100x150?text=No+Poster", width=100)
+        
         with col2:
-            if st.button("👍 Like", key=f"like_{idx}"):
+            st.write(f"**{row['title']}**")
+            st.caption(f"Genres: {row.get('genres', 'N/A')} | Rating: {row.get('vote_average', 'N/A'):.1f}")
+        
+        with col3:
+            if st.button("👍", key=f"like_fb_{idx}"):
                 if row['title'] not in st.session_state.liked_titles:
                     st.session_state.liked_titles.append(row['title'])
-                    st.toast(f"Added '{row['title']}' to liked movies")
-        with col3:
-            if st.button("👎 Dislike", key=f"dislike_{idx}"):
+                    st.success(f"Added **{row['title']}** to liked movies", icon="👍")
+        
+        with col4:
+            if st.button("👎", key=f"dislike_fb_{idx}"):
                 st.session_state.excluded_titles.add(row['title'])
-                st.toast(f"Excluded '{row['title']}'")
+                st.info(f"Excluded **{row['title']}**", icon="👎")
 
 # ====================== REFRESH BUTTON ======================
-if st.button("🔄 Refresh Recommendations", type="secondary"):
-    st.rerun()   # This will re-run the whole script and show updated liked movies + new recommendations
+col_refresh, _ = st.columns([1, 3])
+with col_refresh:
+    if st.button("🔄 Refresh Recommendations", type="secondary"):
+        st.rerun()
 
-st.caption("Liked movies are automatically used for the next recommendation round.")
+st.caption("Liked movies (including feedback) are automatically used when you refresh recommendations.")
