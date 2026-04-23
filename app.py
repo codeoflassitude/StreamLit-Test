@@ -1,285 +1,351 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import MultiLabelBinarizer, MinMaxScaler
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.neighbors import NearestNeighbors
-from sklearn.metrics.pairwise import cosine_similarity
-from sentence_transformers import SentenceTransformer
-import random
+import plotly.express as px
 
-st.set_page_config(page_title="Movie Recommender", layout="wide")
-st.title("🎬 Movie Recommendation System")
-st.markdown("**3 Models • Feedback Loop • Content-based Recommender**")
+from models.content_based_model import ContentBasedModel
+from models.embedding_model import EmbeddingBasedModel
+from models.popularity_hybrid_model import PopularityHybridModel
+from services.explanations import build_recommendation_explanations
+from services.recommendation_utils import (
+    analyze_user_taste,
+    format_recommendations,
+    get_movie_suggestions,
+)
+from services.visualization import (
+    build_overlap_figure,
+    build_visualization_figure,
+    get_pca_projection,
+)
 
-# ====================== LOAD AND PROCESS DATA ======================
-@st.cache_data(show_spinner="Loading and processing movie data...")
-def load_and_process_data():
+# Set page config
+st.set_page_config(page_title="🎬 Movie Recommender", layout="wide")
+
+# ============================================================================
+# LOAD DATA
+# ============================================================================
+@st.cache_data
+def load_data():
+    """Load movie data and feature vectors"""
     df = pd.read_csv("tmdb_movies_filtered_500.csv")
-   
-    def process_genres(genre):
-        if isinstance(genre, str):
-            return [g.strip() for g in genre.split(', ')]
-        return []
-   
-    def process_keywords(keywords):
-        if isinstance(keywords, str):
-            return [k.strip() for k in keywords.split(', ')]
-        return []
-   
-    def keywords_to_text(keyword_list):
-        if isinstance(keyword_list, list):
-            cleaned = [k.strip().lower().replace(' ', '_') for k in keyword_list]
-            return ' '.join(cleaned)
-        return ''
-   
-    df['genres_list'] = df['genres'].apply(process_genres)
-    df['keywords_list'] = df['keywords'].apply(process_keywords)
-    df['keywords_text'] = df['keywords_list'].apply(keywords_to_text)
-   
-    mlb = MultiLabelBinarizer()
-    genres_encoded = mlb.fit_transform(df['genres_list'])
-    genres_df = pd.DataFrame(genres_encoded, columns=mlb.classes_)
-   
-    tfidf = TfidfVectorizer(max_features=500)
-    keywords_tfidf = tfidf.fit_transform(df['keywords_text'])
-    keywords_df = pd.DataFrame(keywords_tfidf.toarray(), columns=tfidf.get_feature_names_out())
-   
-    numerical_columns = ['vote_average', 'vote_count', 'revenue', 'runtime', 'budget', 'popularity']
-    numerical_columns = [col for col in numerical_columns if col in df.columns]
-    scaler = MinMaxScaler()
-    df_num_scaled = pd.DataFrame(scaler.fit_transform(df[numerical_columns]), columns=numerical_columns)
-   
-    genre_weight = 1.5
-    keyword_weight = 2.0
-    rating_weight = 0.5
-   
-    weighted_features = pd.concat([
-        genres_df * genre_weight,
-        keywords_df * keyword_weight,
-        df_num_scaled * rating_weight
-    ], axis=1)
-   
-    if 'overview' in df.columns:
-        df['embed_text'] = df.apply(
-            lambda row: f"Genres: {', '.join(row['genres_list'])}. Keywords: {row['keywords_text']}. Plot: {row['overview']}", axis=1)
-    else:
-        df['embed_text'] = df.apply(
-            lambda row: f"Genres: {', '.join(row['genres_list'])}. Keywords: {row['keywords_text']}", axis=1)
-   
-    return df, weighted_features, tfidf, mlb.classes_
+    movie_features = pd.read_csv("movie_feature_vectors.csv")
+    return df, movie_features
 
-df, weighted_features, tfidf_vectorizer, genre_columns = load_and_process_data()
+df, movie_features = load_data()
 
-# ====================== LOAD MODELS ======================
-@st.cache_resource(show_spinner="Loading embedding model...")
-def load_embedding_model():
-    import warnings
-    from transformers import logging
-    warnings.filterwarnings("ignore")
-    logging.set_verbosity_error()
-    return SentenceTransformer('all-MiniLM-L6-v2', token=False, trust_remote_code=True)
+# Initialize session state
+if 'liked_movies' not in st.session_state:
+    st.session_state.liked_movies = []
 
-embedding_model = load_embedding_model()
+if 'results' not in st.session_state:
+    st.session_state.results = None
 
-@st.cache_data(show_spinner=False)
-def get_embeddings(_df):
-    return embedding_model.encode(_df['embed_text'].tolist(), batch_size=64, convert_to_numpy=True)
+@st.cache_data
+def get_cached_projection(features_df):
+    """Cache PCA projection for visualization."""
+    return get_pca_projection(features_df)
 
-embeddings = get_embeddings(df)
 
-@st.cache_resource(show_spinner=False)
-def get_knn_model(_features):
-    knn = NearestNeighbors(n_neighbors=30, metric='cosine', algorithm='brute')
-    knn.fit(_features.values)
-    return knn
+coords = get_cached_projection(movie_features)
 
-knn_model = get_knn_model(weighted_features)
+# ============================================================================
+# STREAMLIT UI
+# ============================================================================
 
-# ====================== SESSION STATE ======================
-if 'liked_titles' not in st.session_state:
-    st.session_state.liked_titles = []
-if 'excluded_titles' not in st.session_state:
-    st.session_state.excluded_titles = set()
-if 'feedback_movies' not in st.session_state:
-    st.session_state.feedback_movies = []
-if 'rec_df' not in st.session_state:
-    st.session_state.rec_df = None
+st.title("🎬 Movie Recommendation System")
+st.markdown("Find your next favorite movie based on your preferences!")
 
-# ====================== SIDEBAR ======================
-st.sidebar.header("Your Liked Movies")
-liked_input = st.sidebar.multiselect(
-    "Select 3–15 movies you like",
-    options=sorted(df['title'].unique()),
-    default=st.session_state.liked_titles,
-    max_selections=15
-)
+# ============================================================================
+# SIDEBAR - MOVIE SELECTION
+# ============================================================================
 
-if liked_input != st.session_state.liked_titles:
-    st.session_state.liked_titles = liked_input
-
-if st.session_state.liked_titles:
-    st.sidebar.subheader("Currently Liked")
-    for title in st.session_state.liked_titles:
-        st.sidebar.write(f"• {title}")
-
-st.sidebar.subheader("Extra Preferences")
-positive_kw = st.sidebar.text_input("Keywords to emphasize (optional)", 
-                                   placeholder="e.g. dystopian ai virtual_reality")
-avoid_kw = st.sidebar.text_input("Keywords to avoid (optional)", 
-                                placeholder="e.g. horror comedy")
-
-# ====================== MAIN CONTROLS ======================
-st.subheader("Recommendation Settings")
-model_choice = st.radio(
-    "Choose Recommendation Model",
-    ["Cosine Similarity", "KNN-based", "Embedding-based (Semantic)"],
-    horizontal=True
-)
-
-hybrid_weight = st.slider("Hybrid popularity boost", 
-                         min_value=0.0, max_value=0.3, value=0.05, step=0.05)
-
-# ====================== GENERATE RECOMMENDATIONS ======================
-if st.button("🚀 Get Recommendations", type="primary"):
-    if len(st.session_state.liked_titles) < 3:
-        st.error("⚠️ Please select at least 3 movies you like.")
-        st.stop()
-
-    liked_df = df[df['title'].isin(st.session_state.liked_titles)]
+with st.sidebar:
+    st.header("Step 1: Select Your Favorite Movies")
     
-    if model_choice == "Embedding-based (Semantic)":
-        liked_emb = embeddings[liked_df.index]
-        user_vec = liked_emb.mean(axis=0)
-        if positive_kw.strip():
-            extra_emb = embedding_model.encode([positive_kw.strip()])
-            user_vec = (user_vec * len(liked_df) + extra_emb[0]) / (len(liked_df) + 1)
-        sims = cosine_similarity([user_vec], embeddings)[0]
-       
-    elif model_choice == "Cosine Similarity":
-        user_vec = weighted_features.loc[liked_df.index].mean(axis=0).values.reshape(1, -1)
-        sims = cosine_similarity(user_vec, weighted_features.values)[0]
-       
-    else:  # KNN
-        user_vec = weighted_features.loc[liked_df.index].mean(axis=0).values.reshape(1, -1)
-        distances, indices = knn_model.kneighbors(user_vec)
-        sims = 1 - distances[0]
-        sims_full = np.zeros(len(df))
-        sims_full[indices[0]] = sims
-        sims = sims_full
-   
-    pop = df['popularity'].values
-    scores = sims * (1 + hybrid_weight * (pop / pop.max()))
-   
-    rec_indices = np.argsort(scores)[::-1]
-    filtered = []
-    avoid_list = [k.strip().lower() for k in avoid_kw.split() if k.strip()] if avoid_kw else []
-   
-    for i in rec_indices:
-        title = df.iloc[i]['title']
-        if title in st.session_state.liked_titles or title in st.session_state.excluded_titles:
-            continue
-        if avoid_list and any(k in str(df.iloc[i]['keywords_text']).lower() for k in avoid_list):
-            continue
-        filtered.append(i)
-        if len(filtered) >= 20:
-            break
-   
-    st.session_state.rec_df = df.iloc[filtered][['title', 'genres', 'vote_average', 'popularity', 'keywords_text', 'poster_path']].copy()
-    st.session_state.rec_df['score'] = [scores[i] for i in filtered]
-    st.session_state.rec_df = st.session_state.rec_df.head(20)
+    # Search input
+    search_query = st.text_input(
+        "🔍 Search for a movie:",
+        placeholder="Type movie name..."
+    )
     
-    st.success(f"✅ Top 20 recommendations using **{model_choice}**")
-
-    st.subheader("🎥 Recommended Movies")
-
-    # Use the saved recommendations from session state
-    if 'rec_df' in st.session_state and not st.session_state.rec_df.empty:
-        for _, row in st.session_state.rec_df.iterrows():
-            col1, col2 = st.columns([1, 3])
-            
-            with col1:
-                # Show movie poster
-                if 'poster_path' in df.columns and pd.notna(row.get('poster_path')):
-                    poster_url = f"https://image.tmdb.org/t/p/w500{row['poster_path']}"
-                    st.image(poster_url, width=160)
-                else:
-                    st.image("https://via.placeholder.com/150x225?text=No+Poster", width=160)
-            
-            with col2:
-                st.subheader(row['title'])
-                
-                # Rating
-                vote = row.get('vote_average', 0)
-                st.write(f"**IMDb Rating:** ⭐ {vote:.1f}/10")
-                
-                # Genres
-                st.write(f"**Genres:** {row.get('genres', 'N/A')}")
-                
-                # Why you may like this (based on keywords)
-                keywords = str(row.get('keywords_text', ''))
-                if keywords.strip():
-                    kw_list = [k.replace('_', ' ').title() for k in keywords.split() if k.strip()]
-                    why_text = ", ".join(kw_list[:12])   # Limit to 12 nice-looking keywords
-                    st.write(f"**Why you may like this:** {why_text}")
-                else:
-                    st.write("**Why you may like this:** Similar in genre and story style")
-            
-            st.divider()  # Clean separation between movies
-    else:
-        st.info("No recommendations generated yet. Click 'Get Recommendations' above.")
-
-# ====================== FEEDBACK LOOP (Random Movies with Posters) ======================
-st.subheader("💬 Feedback Loop - Discover & Rate Random Movies")
-st.caption("Rate these random movies to help fine-tune your taste. Use 👍 to add to liked movies and 👎 to exclude.")
-
-if st.button("🎲 Show Random Movies for Feedback"):
-    # Generate 10–12 random movies (excluding already liked or excluded)
-    available = df[~df['title'].isin(list(st.session_state.liked_titles) + list(st.session_state.excluded_titles))]
-    if len(available) > 0:
-        sample_size = min(12, len(available))
-        random_indices = random.sample(range(len(available)), sample_size)
-        st.session_state.feedback_movies = available.iloc[random_indices].index.tolist()
-    else:
-        st.warning("No more movies available for feedback.")
-        st.session_state.feedback_movies = []
-
-# Show feedback movies with posters
-if st.session_state.get('feedback_movies'):
-    st.write("**Rate these movies:**")
-    
-    for idx in st.session_state.feedback_movies:
-        row = df.iloc[idx]
-        poster_path = row.get('poster_path')  # Change column name if different
+    # Show suggestions
+    if search_query and len(search_query) > 1:
+        suggestions = get_movie_suggestions(df, search_query)
         
-        col1, col2, col3, col4 = st.columns([1.2, 5, 1, 1])
-        
+        if suggestions:
+            selected_movie = st.selectbox(
+                "Select from suggestions:",
+                suggestions,
+                key="movie_selector"
+            )
+            
+            if st.button("➕ Add Movie"):
+                movie_idx = df[df['title'] == selected_movie].index[0]
+                
+                if selected_movie not in st.session_state.liked_movies:
+                    if len(st.session_state.liked_movies) < 5:
+                        st.session_state.liked_movies.append(selected_movie)
+                        st.success(f"✓ Added: {selected_movie}")
+                    else:
+                        st.error("⚠️ Maximum 5 movies selected!")
+                else:
+                    st.warning("Movie already in your list!")
+    
+    # Display selected movies
+    st.markdown("---")
+    st.subheader(f"Your Selection ({len(st.session_state.liked_movies)}/5)")
+    
+    for i, movie in enumerate(st.session_state.liked_movies, 1):
+        col1, col2 = st.columns([4, 1])
         with col1:
-            if pd.notna(poster_path) and str(poster_path).strip() != "":
-                poster_url = f"https://image.tmdb.org/t/p/w200/{poster_path}"
-                st.image(poster_url, width=100)
-            else:
-                st.image("https://via.placeholder.com/100x150?text=No+Poster", width=100)
-        
+            st.write(f"{i}. {movie}")
         with col2:
-            st.write(f"**{row['title']}**")
-            st.caption(f"Genres: {row.get('genres', 'N/A')} | Rating: {row.get('vote_average', 'N/A'):.1f}")
-        
-        with col3:
-            if st.button("👍", key=f"like_fb_{idx}"):
-                if row['title'] not in st.session_state.liked_titles:
-                    st.session_state.liked_titles.append(row['title'])
-                    st.success(f"Added **{row['title']}** to liked movies", icon="👍")
-        
-        with col4:
-            if st.button("👎", key=f"dislike_fb_{idx}"):
-                st.session_state.excluded_titles.add(row['title'])
-                st.info(f"Excluded **{row['title']}**", icon="👎")
+            if st.button("❌", key=f"remove_{i}"):
+                st.session_state.liked_movies.pop(i-1)
+                st.session_state.results = None
+                st.rerun()
 
-# ====================== REFRESH BUTTON ======================
-col_refresh, _ = st.columns([1, 3])
-with col_refresh:
-    if st.button("🔄 Refresh Recommendations", type="secondary"):
-        st.rerun()
+# ============================================================================
+# MAIN CONTENT
+# ============================================================================
 
-st.caption("Liked movies (including feedback) are automatically used when you refresh recommendations.")
+if len(st.session_state.liked_movies) >= 3:
+    st.markdown("---")
+    
+    # Step 2: Model Selection
+    st.header("Step 2: Choose Recommendation Model")
+    
+    model_choice = st.radio(
+        "Select a model:",
+        ["Content-Based", "Semantic Embedding", "Popularity Hybrid"],
+        help="Choose how movies should be recommended to you"
+    )
+    
+    # Show model explanation with technical details
+    model_explanations = {
+        "Content-Based": {
+            "icon": "📋",
+            "title": "Content-Based Filtering",
+            "desc": "Analyzes genres, keywords, and numerical features of your favorite movies to find similar ones.",
+            "technical": """
+**Algorithm**: Feature Averaging + Cosine Similarity
+
+**How it works**:
+1. Extracts 556 features per movie: 50 genre indicators (one-hot), 500 TF-IDF keyword scores, 6 numerical metrics (rating, popularity, budget, etc.)
+2. Creates user profile: `user_vector = average(liked_movies_features)`
+3. Computes cosine similarity: `similarity = (user·movie) / (||user|| × ||movie||)` for all movies
+4. Returns top recommendations by similarity score
+
+**Pros**: Fast (< 100ms), transparent, no data requirements
+**Cons**: Misses semantic meaning, can be too specific to liked movie features
+            """
+        },
+        "Semantic Embedding": {
+            "icon": "🧠",
+            "title": "Semantic Embedding (AI-Powered)",
+            "desc": "Uses neural networks to understand movie plots and themes. Finds movies with similar stories even if they don't share keywords.",
+            "technical": """
+**Algorithm**: Sentence-Transformers (BERT-based) + Cosine Similarity
+
+**How it works**:
+1. Uses pre-trained `all-MiniLM-L6-v2` model (138M parameters) to encode movie overviews
+2. Each plot → 384-dimensional semantic embedding (captures meaning, themes, narrative patterns)
+3. Creates user profile: `user_embedding = average(liked_movies_embeddings)`
+4. Computes cosine similarity in embedding space for all movies
+5. Returns top recommendations by semantic similarity
+
+**Architecture**: Transformer-based (BERT-variant), trained on 215M+ sentence pairs for semantic understanding
+
+**Pros**: Finds thematically similar movies, discovers hidden connections, generalizes well
+**Cons**: Slower (~1-2s initial encoding), depends on plot description quality, requires pre-trained model
+            """
+        },
+        "Popularity Hybrid": {
+            "icon": "⭐",
+            "title": "Popularity Hybrid",
+            "desc": "Balances personal taste with movie popularity. Recommends well-rated movies that match your preferences.",
+            "technical": """
+**Algorithm**: Weighted Blend of Content Similarity + Popularity Metrics
+
+**How it works**:
+1. Computes content similarity (same as Content-Based): user_vector averaged from liked movies
+2. Normalizes content scores to [0, 1] range
+3. Calculates popularity score: `popularity_norm = (popularity - min) / (max - min)`
+4. Calculates quality score: `0.6 × (rating/10) + 0.4 × vote_count_norm`
+5. Blends: `hybrid_score = 0.7 × content_similarity + 0.3 × popularity`
+6. Returns top recommendations by hybrid score
+
+**Weighting**: 70% personalization, 30% popularity (tunable)
+
+**Pros**: Balances niche with mainstream, reduces risk of recommending obscure low-quality films
+**Cons**: May favor popular movies even if less similar to your taste
+            """
+        }
+    }
+    
+    exp = model_explanations[model_choice]
+    st.info(f"**{exp['icon']} {exp['title']}**: {exp['desc']}")
+    
+    with st.expander("📊 Technical Details"):
+        st.markdown(exp['technical'])
+
+    n_recommendations = 5
+    
+    # Generate recommendations
+    if st.button("🚀 Get Recommendations", type="primary", use_container_width=True):
+        with st.spinner("Analyzing your taste and generating recommendations..."):
+            # Get indices of liked movies
+            liked_indices = [df[df['title'] == m].index[0] for m in st.session_state.liked_movies]
+            
+            # Analyze user taste
+            taste_profile = analyze_user_taste(df, liked_indices)
+            
+            # Generate recommendations for all models (for comparison visualization)
+            content_model = ContentBasedModel(movie_features)
+            content_rec_indices, content_scores = content_model.recommend(liked_indices, n_recommendations)
+
+            embedding_model = EmbeddingBasedModel(df)
+            embedding_rec_indices, embedding_scores = embedding_model.recommend(liked_indices, n_recommendations)
+
+            hybrid_model = PopularityHybridModel(movie_features, df)
+            hybrid_rec_indices, hybrid_scores = hybrid_model.recommend(liked_indices, n_recommendations)
+
+            # Active model for main recommendations tab
+            model_map = {
+                "Content-Based": (content_rec_indices, content_scores),
+                "Semantic Embedding": (embedding_rec_indices, embedding_scores),
+                "Popularity Hybrid": (hybrid_rec_indices, hybrid_scores)
+            }
+            rec_indices, scores = model_map[model_choice]
+
+            explanations = build_recommendation_explanations(
+                df=df,
+                movie_features_df=movie_features,
+                rec_indices=rec_indices,
+                liked_indices=liked_indices,
+                scores=scores,
+                model_name=model_choice
+            )
+
+            st.session_state.results = {
+                'model_choice': model_choice,
+                'liked_indices': liked_indices,
+                'rec_indices': rec_indices,
+                'scores': scores,
+                'content_rec_indices': content_rec_indices,
+                'content_scores': content_scores,
+                'embedding_rec_indices': embedding_rec_indices,
+                'embedding_scores': embedding_scores,
+                'hybrid_rec_indices': hybrid_rec_indices,
+                'hybrid_scores': hybrid_scores,
+                'taste_profile': taste_profile,
+                'recs_df': format_recommendations(df, rec_indices, scores),
+                'explanations': explanations
+            }
+
+    if st.session_state.results is not None:
+        results = st.session_state.results
+        st.markdown("---")
+
+        tab1, tab2 = st.tabs(["Recommendations", "Why These Movies"])
+
+        with tab1:
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Movies Analyzed", results['taste_profile']['num_movies'])
+            with col2:
+                st.metric("Avg Rating", f"{results['taste_profile']['avg_rating']:.1f}/10")
+            with col3:
+                st.metric("Avg Popularity", f"{results['taste_profile']['avg_popularity']:.0f}")
+
+            st.subheader("📊 Your Taste Profile")
+            fig = px.pie(
+                values=results['taste_profile']['genres'].values,
+                names=results['taste_profile']['genres'].index,
+                title="Genre Distribution of Your Favorites"
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            mood_col, time_col = st.columns(2)
+
+            with mood_col:
+                st.markdown("**Mood themes from your liked movies**")
+                top_keywords = results['taste_profile'].get('top_keywords')
+                if top_keywords is not None and len(top_keywords) > 0:
+                    mood_line = " • ".join([kw.title() for kw in top_keywords.index[:6]])
+                    st.write(mood_line)
+                else:
+                    st.caption("Not enough keyword data to infer mood themes.")
+
+            with time_col:
+                st.markdown("**Your time preference**")
+                avg_year = results['taste_profile'].get('avg_year')
+                favorite_decade = results['taste_profile'].get('favorite_decade')
+                if favorite_decade is not None:
+                    if avg_year is not None:
+                        st.write(f"Mostly {favorite_decade}s films • Average release year: {avg_year:.0f}")
+                    else:
+                        st.write(f"Mostly {favorite_decade}s films")
+                else:
+                    st.caption("Release year data is limited for this selection.")
+
+            st.subheader(f"🎯 Recommended Movies ({results['model_choice']})")
+            rec_indices_array = np.asarray(results['rec_indices']).flatten()
+            for pos, (_, row) in enumerate(results['recs_df'].iterrows()):
+                rec_idx = int(rec_indices_array[pos])
+                exp = results['explanations'][rec_idx]
+
+                with st.container(border=True):
+                    poster_col, info_col = st.columns([1, 3])
+
+                    with poster_col:
+                        poster_url = row.get('Poster URL')
+                        if isinstance(poster_url, str) and poster_url:
+                            st.image(poster_url, use_container_width=True)
+                        else:
+                            st.caption("Poster unavailable")
+
+                    with info_col:
+                        st.markdown(f"### {row['Title']}")
+                        st.caption(f"Release Date: {row['Release Date']}")
+
+                        score_col1, score_col2 = st.columns(2)
+                        with score_col1:
+                            st.metric("IMDb Rating", f"{row['IMDb Rating']}/10")
+                        with score_col2:
+                            st.metric("Match Score", f"{row['similarity_score']}%")
+
+                        st.write(f"**Genres:** {row['Genres']}")
+                        st.write(f"**Language:** {row['Language']}")
+                        st.write(f"**Description:** {row['Description']}")
+                        st.info(exp['summary'])
+
+        with tab2:
+            st.subheader("🔍 Why each movie was recommended")
+            rec_indices_array = np.asarray(results['rec_indices']).flatten()
+            for pos, (_, row) in enumerate(results['recs_df'].iterrows()):
+                rec_idx = int(rec_indices_array[pos])
+                exp = results['explanations'][rec_idx]
+
+                with st.container(border=True):
+                    st.markdown(f"### {row['Title']}")
+                    st.write(f"**Model score:** {exp['model_score']}%")
+                    st.write(f"**Closest liked movie:** {exp['nearest_title']} ({exp['nearest_similarity']}% similarity)")
+
+                    shared_genres_text = ', '.join(exp['shared_genres']) if exp['shared_genres'] else 'None detected'
+                    shared_keywords_text = ', '.join(exp['shared_keywords']) if exp['shared_keywords'] else 'None detected'
+
+                    st.write(f"**Shared genres:** {shared_genres_text}")
+                    st.write(f"**Shared keywords:** {shared_keywords_text}")
+                    st.write(f"**Why chosen:** {exp['summary']}")
+            
+else:
+    # Placeholder when not enough movies selected
+    st.info(f"👉 Select at least 3 favorite movies to get started! ({len(st.session_state.liked_movies)}/3)")
+    
+    st.markdown("""
+    ### How it works:
+    1. **Search & Select:** Find your favorite movies using the search bar
+    2. **Choose Model:** Pick between Cosine Similarity or KNN
+    3. **Get Recommendations:** See personalized movie suggestions with analysis!
+    """)
